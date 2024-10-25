@@ -1,5 +1,5 @@
 #!/bin/bash
-#################### x-ui-pro v3.0.0 @ github.com/GFW4Fun ##############################################
+#################### x-ui-pro v6.6.7 @ github.com/GFW4Fun ##############################################
 [[ $EUID -ne 0 ]] && echo "not root!" && sudo su -
 ##############################INFO######################################################################
 msg_ok() { echo -e "\e[1;42m $1 \e[0m";}
@@ -9,7 +9,7 @@ echo;msg_inf '           ___    _   _   _  '	;
 msg_inf		 ' \/ __ | |  | __ |_) |_) / \ '	;
 msg_inf		 ' /\    |_| _|_   |   | \ \_/ '	; echo
 ##################################Variables#############################################################
-XUIDB="/etc/x-ui/x-ui.db";domain="";UNINSTALL="x";INSTALL="n";PNLNUM=0;CFALLOW="n"
+XUIDB="/etc/x-ui/x-ui.db";domain="";UNINSTALL="x";INSTALL="n";PNLNUM=0;CFALLOW="n";NOPATH="";
 Pak=$(type apt &>/dev/null && echo "apt" || echo "dnf")
 ##################################Random Port and Path #################################################
 RNDSTR=$(tr -dc A-Za-z0-9 </dev/urandom | head -c "$(shuf -i 6-12 -n 1)")
@@ -34,12 +34,13 @@ done
 ##############################Uninstall#################################################################
 UNINSTALL_XUI(){
 	printf 'y\n' | x-ui uninstall
-	rm -rf "/etc/x-ui/" "/usr/local/x-ui/" "/usr/bin/x-ui/"
-	for i in nginx nginx-common nginx-core nginx-full python3-certbot-nginx tor; do
+	for i in nginx python3-certbot-nginx tor; do
 		$Pak -y remove $i
 	done
-	#rm -rf "/var/www/html/" "/etc/nginx/" "/usr/share/nginx/" 
+ 	#$Pak -y autoremove
 	crontab -l | grep -v "certbot\|x-ui\|cloudflareips" | crontab -
+	#rm -rf "/var/www/html/" "/etc/nginx/" "/usr/share/nginx/" 
+	#rm -rf "/etc/x-ui/" "/usr/local/x-ui/" "/usr/bin/x-ui/"
 }
 if [[ ${UNINSTALL} == *"y"* ]]; then
 	UNINSTALL_XUI	
@@ -63,16 +64,22 @@ fi
 ###############################Install Packages#########################################################
 if [[ ${INSTALL} == *"y"* ]]; then
 	$Pak -y update
-	for i in epel-release unzip curl nginx certbot python3-certbot-nginx sqlite sqlite3 tor; do
+	for i in epel-release cronie psmisc unzip curl nginx certbot python3-certbot-nginx sqlite sqlite3 tor; do
 		$Pak -y install $i
 	done
 	systemctl daemon-reload
  	systemctl enable nginx.service
   	systemctl enable tor.service
-	systemctl start tor
+   	systemctl enable cron.service > /dev/null 2>&1
+   	systemctl enable crond.service > /dev/null 2>&1
+    	systemctl restart cron crond > /dev/null 2>&1
+	systemctl start nginx
+   	systemctl start tor
 fi
-systemctl stop nginx 
-fuser -k 80/tcp 80/udp 443/tcp 443/udp 2>/dev/null
+###############################Stop nginx#############################################################
+sudo nginx -s stop 2>/dev/null
+sudo systemctl stop nginx 2>/dev/null
+sudo fuser -k 80/tcp 80/udp 443/tcp 443/udp 2>/dev/null
 ##################################GET SERVER IPv4-6#####################################################
 IP4_REGEX="^[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}$"
 IP6_REGEX="([a-f0-9:]+:+)+[a-f0-9]+"
@@ -84,43 +91,41 @@ IP6=$(ip route get 2620:fe::fe 2>&1 | grep -Po -- 'src \K\S*')
 certbot certonly --standalone --non-interactive --force-renewal --agree-tos --register-unsafely-without-email --cert-name "$MainDomain" -d "$domain"
 if [[ ! -d "/etc/letsencrypt/live/${MainDomain}/" ]]; then
  	systemctl start nginx >/dev/null 2>&1
-	msg_err "$MainDomain SSL could not be generated! Check Domain/IP Or Enter new domain!" && exit 1
+	msg_err "$MainDomain SSL failed! Check Domain/IP! Exceeded limit!? Try another domain or VPS!" && exit 1
 fi
 ################################# Access to configs only with cloudflare#################################
 mkdir -p /etc/nginx/sites-{available,enabled}
-mkdir -p /usr/share/nginx
 mkdir -p /var/log/nginx
 mkdir -p /var/www
 mkdir -p /var/www/html
-
 rm -rf "/etc/nginx/default.d"
-rm -f "/etc/nginx/cloudflareips.sh"
 
-if [ $Pak == "dnf" ]; then
-rm -f "/etc/nginx/nginx.conf"
-cat << 'EOF' >> /etc/nginx/nginx.conf
-user nginx;
+nginxusr="www-data"
+if ! id -u "$nginxusr" > /dev/null 2>&1; then
+    nginxusr="nginx"
+fi
+
+cat > "/etc/nginx/nginx.conf" << EOF
+user $nginxusr;
 worker_processes auto;
 pid /run/nginx.pid;
 include /etc/nginx/modules-enabled/*.conf;
-include /usr/share/nginx/modules/*.conf;
 events {worker_connections 2048;}
 http {
-	sendfile            on;
-	tcp_nopush          on;
-	tcp_nodelay         on;
-	keepalive_timeout   65;
+	gzip on;
+	sendfile on;
+	tcp_nopush on;
 	types_hash_max_size 4096;
-	include /etc/nginx/mime.types;
-	default_type application/octet-stream;
 	access_log /var/log/nginx/access.log;
 	error_log /var/log/nginx/error.log;
+	default_type application/octet-stream;
+	include /etc/nginx/*.types;
 	include /etc/nginx/conf.d/*.conf;
 	include /etc/nginx/sites-enabled/*;
 }
 EOF
-fi
 
+rm -f "/etc/nginx/cloudflareips.sh"
 cat << 'EOF' >> /etc/nginx/cloudflareips.sh
 #!/bin/bash
 rm -f "/etc/nginx/conf.d/cloudflare_real_ips.conf" "/etc/nginx/conf.d/cloudflare_whitelist.conf"
@@ -145,19 +150,56 @@ if [[ ${CFALLOW} == *"y"* ]]; then
 	else	
 	CF_IP="#";
 fi
-###################################Get Installed XUI Port/Path##########################################
+######################################## add_slashes /webBasePath/ #####################################
+add_slashes() {
+    [[ "$1" =~ ^/ ]] || set -- "/$1"
+    [[ "$1" =~ /$ ]] || set -- "$1/"
+    echo "$1"
+}
+########################################Update X-UI Port/Path for first INSTALL#########################
+UPDATE_XUIDB(){
 if [[ -f $XUIDB ]]; then
-	XUIPORT=$(sqlite3 -list $XUIDB 'SELECT "value" FROM settings WHERE "key"="webPort" LIMIT 1;' 2>&1)
-	XUIPATH=$(sqlite3 -list $XUIDB 'SELECT "value" FROM settings WHERE "key"="webBasePath" LIMIT 1;' 2>&1)
-if [[ $XUIPORT -gt 0 && $XUIPORT != "54321" && $XUIPORT != "2053" ]] && [[ ${#XUIPATH} -gt 4 ]]; then
-	RNDSTR=$(echo "$XUIPATH" 2>&1 | tr -d '/')
-	PORT=$XUIPORT
-	sqlite3 $XUIDB <<EOF
-	DELETE FROM "settings" WHERE ( "key"="webCertFile" ) OR ( "key"="webKeyFile" ); 
-	INSERT INTO "settings" ("key", "value") VALUES ("webCertFile",  "");
-	INSERT INTO "settings" ("key", "value") VALUES ("webKeyFile", "");
+x-ui stop > /dev/null 2>&1
+fuser "$XUIDB" 2>/dev/null
+RNDSTRSLASH=$(add_slashes "$RNDSTR")
+sqlite3 "$XUIDB" << EOF
+	DELETE FROM 'settings' WHERE key IN ('webPort', 'webCertFile', 'webKeyFile', 'webBasePath');
+	INSERT INTO 'settings' (key, value) VALUES ('webPort', '${PORT}'),('webCertFile', ''),('webKeyFile', ''),('webBasePath', '${RNDSTRSLASH}');
 EOF
 fi
+}
+###################################Install X-UI#########################################################
+if ! systemctl is-active --quiet x-ui; then
+	PANEL=( "https://raw.githubusercontent.com/alireza0/x-ui/master/install.sh"
+		"https://raw.githubusercontent.com/mhsanaei/3x-ui/master/install.sh"
+	)
+
+	printf 'n\n' | bash <(wget -qO- "${PANEL[$PNLNUM]}")
+ 
+	if ! systemctl is-enabled --quiet x-ui; then
+		systemctl daemon-reload
+		systemctl enable x-ui.service
+	fi	
+ 
+ 	UPDATE_XUIDB
+fi
+###################################Get Installed XUI Port/Path##########################################
+if [[ -f $XUIDB ]]; then
+	x-ui stop > /dev/null 2>&1
+ 	fuser "$XUIDB" 2>/dev/null
+	PORT=$(sqlite3 "${XUIDB}" "SELECT value FROM settings WHERE key='webPort' LIMIT 1;" 2>&1)
+ 	RNDSTR=$(sqlite3 "${XUIDB}" "SELECT value FROM settings WHERE key='webBasePath' LIMIT 1;" 2>&1)
+	if [[ -z "${PORT}" ]] || ! [[ "${PORT}" =~ ^-?[0-9]+$ ]]; then
+		PORT="2053"
+  	fi
+	if [ -z "$RNDSTR" ] || [ "$RNDSTR" == "/" ]; then
+		NOPATH="#"
+	fi		
+	RNDSTR=$(add_slashes "$RNDSTR" | tr -d '[:space:]')
+else
+	PORT="2053"
+	RNDSTR="/"
+	NOPATH="#"
 fi
 #################################Nginx Config###########################################################
 cat > "/etc/nginx/sites-available/$MainDomain" << EOF
@@ -165,9 +207,9 @@ server {
 	server_tokens off;
 	server_name $MainDomain *.$MainDomain;
 	listen 80;
-	listen 443 ssl http2;
+	listen 443 ssl;
 	listen [::]:80;
-	listen [::]:443 ssl http2;
+	listen [::]:443 ssl;
 	index index.html index.htm index.php index.nginx-debian.html;
 	root /var/www/html/;
 	ssl_protocols TLSv1.2 TLSv1.3;
@@ -182,7 +224,7 @@ server {
 	error_page 400 401 402 403 500 501 502 503 504 =404 /404;
 	proxy_intercept_errors on;
 	#X-UI Admin Panel
-	location /$RNDSTR/ {
+	location $RNDSTR {
 		proxy_redirect off;
 		proxy_set_header Host \$host;
 		proxy_set_header X-Real-IP \$remote_addr;
@@ -190,8 +232,8 @@ server {
 		proxy_pass http://127.0.0.1:$PORT;
 		break;
 	}
- 	#Subscription Path (simple/encode)
-        location ~ ^/(?<fwdport>\d+)/sub/(?<fwdpath>.*)\$ {
+	#Subscription Path (simple/encode)
+	location ~ ^/(?<fwdport>\d+)/sub/(?<fwdpath>.*)\$ {
                 if (\$hack = 1) {return 404;}
                 proxy_redirect off;
                 proxy_set_header Host \$host;
@@ -201,7 +243,7 @@ server {
                 break;
         }
 	#Subscription Path (json/fragment)
-        location ~ ^/(?<fwdport>\d+)/json/(?<fwdpath>.*)\$ {
+	location ~ ^/(?<fwdport>\d+)/json/(?<fwdpath>.*)\$ {
                 if (\$hack = 1) {return 404;}
                 proxy_redirect off;
                 proxy_set_header Host \$host;
@@ -210,7 +252,7 @@ server {
                 proxy_pass http://127.0.0.1:\$fwdport/json/\$fwdpath\$is_args\$args;
                 break;
         }
- 	#Xray Config Path
+	#Xray Config Path
 	location ~ ^/(?<fwdport>\d+)/(?<fwdpath>.*)\$ {
 	$CF_IP	if (\$cloudflare_ip != 1) {return 404;}
 		if (\$hack = 1) {return 404;}
@@ -243,7 +285,7 @@ server {
 			break;
 		}
 	}
-	location / { try_files \$uri \$uri/ =404; }
+	$NOPATH location / { try_files \$uri \$uri/ =404; }
 }
 EOF
 ##################################Check Nginx status####################################################
@@ -256,43 +298,15 @@ else
 fi
 
 if [[ $(nginx -t 2>&1 | grep -o 'successful') != "successful" ]]; then
-    msg_err "nginx config is not ok!" && exit 1
+	msg_err "nginx config is not ok!"
+	systemctl restart nginx
 else
 	systemctl start nginx 
-fi
-########################################Update X-UI Port/Path for first INSTALL#########################
-UPDATE_XUIDB(){
-if [[ -f $XUIDB ]]; then
-	sqlite3 $XUIDB <<EOF
-	DELETE FROM "settings" WHERE ( "key"="webPort" ) OR ( "key"="webCertFile" ) OR ( "key"="webKeyFile" ) OR ( "key"="webBasePath" ); 
-	INSERT INTO "settings" ("key", "value") VALUES ("webPort",  "${PORT}");
-	INSERT INTO "settings" ("key", "value") VALUES ("webCertFile",  "");
-	INSERT INTO "settings" ("key", "value") VALUES ("webKeyFile", "");
-	INSERT INTO "settings" ("key", "value") VALUES ("webBasePath", "/${RNDSTR}/");
-EOF
-else
-	msg_err "x-ui.db file not exist! Maybe x-ui isn't installed." && exit 1;
-fi
-}
-###################################Install X-UI#########################################################
-if systemctl is-active --quiet x-ui; then
-	x-ui restart
-else
-	PANEL=( "https://raw.githubusercontent.com/alireza0/x-ui/master/install.sh"
-			"https://raw.githubusercontent.com/mhsanaei/3x-ui/master/install.sh"
-			"https://raw.githubusercontent.com/FranzKafkaYu/x-ui/master/install_en.sh"
-		)
-
-	printf 'n\n' | bash <(wget -qO- "${PANEL[$PNLNUM]}")
-	UPDATE_XUIDB
-	if ! systemctl is-enabled --quiet x-ui; then
-		systemctl daemon-reload && systemctl enable x-ui.service
-	fi
-	x-ui restart
+ 	x-ui start > /dev/null 2>&1
 fi
 ######################cronjob for ssl/reload service/cloudflareips######################################
 crontab -l | grep -v "certbot\|x-ui\|cloudflareips" | crontab -
-(crontab -l 2>/dev/null; echo '@daily sudo systemctl restart x-ui nginx tor > /dev/null 2>&1') | crontab -
+(crontab -l 2>/dev/null; echo '@daily sudo systemctl restart x-ui nginx tor > /dev/null 2>&1;') | crontab -
 (crontab -l 2>/dev/null; echo '@weekly bash /etc/nginx/cloudflareips.sh > /dev/null 2>&1;') | crontab -
 (crontab -l 2>/dev/null; echo '@monthly certbot renew --nginx --force-renewal --non-interactive --post-hook "nginx -s reload" > /dev/null 2>&1;') | crontab -
 ##################################Show Details##########################################################
@@ -304,13 +318,13 @@ if systemctl is-active --quiet x-ui; then clear
 	certbot certificates | grep -i 'Path:\|Domains:\|Expiry Date:'
 	msg_inf "- - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -"
 	if [[ -n $IP4 ]] && [[ "$IP4" =~ $IP4_REGEX ]]; then 
-		msg_inf "IPv4: http://$IP4:$PORT/$RNDSTR/"
+		msg_inf "IPv4: http://$IP4:$PORT$RNDSTR"
 	fi
 	if [[ -n $IP6 ]] && [[ "$IP6" =~ $IP6_REGEX ]]; then 
-		msg_inf "IPv6: http://[$IP6]:$PORT/$RNDSTR/"
+		msg_inf "IPv6: http://[$IP6]:$PORT$RNDSTR"
 	fi
 	msg_inf "- - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -"
-	msg_inf "X-UI Secure Panel: https://${domain}/${RNDSTR}\n"
+	msg_inf "X-UI Secure Panel: https://${domain}${RNDSTR}\n"
  	echo -n "Username:  " && sqlite3 $XUIDB 'SELECT "username" FROM users;'
 	echo -n "Password:  " && sqlite3 $XUIDB 'SELECT "password" FROM users;'
 	msg_inf "- - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -"
